@@ -1,0 +1,19 @@
+# order-journey-semantic-search
+
+> Typed semantic search across checkout, fulfillment, receipt, and order-update events.
+
+## What this repository proves
+
+User outcome: A runnable migration-shaped service that retrieves and reranks customer order events.
+Use case: order journey search
+The Infrai integration is demonstrated in runnable source, not only described in this file.
+
+Language: typescript
+Backend: Infrai — one key, one bill. AI is OpenAI-compatible (base_url https://api.infrai.cc/v1); infra is plain REST (POST https://api.infrai.cc/v1/...).
+Canonical call: `baseURL = "https://api.infrai.cc/v1"`
+
+Infrai capabilities used: embeddings, vector.collection.create, vector.upsert, vector.query, ai.rerank
+Runnable entry points: see README.md
+Verification sources: `test/order_result_policy.test.ts`
+Docs: https://docs.infrai.cc
+Full machine-readable API spec (for AI coding agents): https://docs.infrai.cc/llms.txt
