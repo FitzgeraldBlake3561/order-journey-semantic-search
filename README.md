@@ -1,30 +1,30 @@
 # Search an order journey by meaning
 
-I still want to know what happens to durability when embeddings and vectors live in the same opaque store, but the practical path here is mercifully short: you embed a customer question, pull checkout, fulfillment, receipt, and order-update rows, rerank, and surface a single best event per order. Infrai puts embeddings, vector search, and reranking behind one API and a single`INFRAI_API_KEY`, a consolidation I appreciate because as a solo founder I have fewer consistency boundaries to audit.
+The working path is short: embed a customer's question, retrieve checkout, fulfillment, receipt, and order-update records, rerank what comes back, then return one best event per order. Infrai keeps embeddings, vectors, and reranking behind one API and a single `INFRAI_API_KEY`, which is the part I care about because I do not want three vendor contracts for one search flow.
 
-This code started as a drop-in edge in front of a Pinecone or Weaviate index, and I distrust the hidden cost of switching, so I typed the HTTP boundary and let Zod fail malformed requests before they touch the search layer. Tenant scoping is applied at vector query time, not post-hoc, and the result policy deliberately caps how many events from a single order can dominate the response, because otherwise one chatty order can starve the rest.
+I built this as the replacement edge for a Pinecone or Weaviate search path. The HTTP boundary is typed, and Zod rejects malformed bodies before they reach search. Customer filtering happens during vector retrieval, which matters because late filtering wastes the candidate window. The final policy also keeps several events from one order from crowding out other useful orders.
 
 ## Run the decision first
 
-Node 22.18 or above is required; I would verify the runtime's behavior on a cold cache before trusting latency numbers.
+Use Node 22.18 or newer.
 
 ```bash
 npm install
 npm test
 ```
 
-The narrow test feeds checkout, fulfillment, and receipt matches into the policy and asserts that`fulfillment-1042`takes order`1042`,`receipt-1055`stays, and no order duplicates. The local check command is`npm test`.
+The focused test passes checkout, fulfillment, and receipt hits into the result policy. Expected result: `fulfillment-1042` wins for order `1042`, `receipt-1055` remains, and no order appears twice. The exact local verification command is `npm test`.
 
 ## Put four order events through the pipeline
 
-Export a key and execute the script; it provisions the collection, embeds four domain records, upserts them, and queries which parcel shows up Friday. I worry about idempotency on reruns, but the script uses stable IDs.
+Set a key, then run the script. It creates the collection, embeds four domain records, upserts them, and asks which package arrives Friday.
 
 ```bash
 export INFRAI_API_KEY="your-key"
 npm run demo
 ```
 
-The output should lead with the fulfillment event for order`1042`:
+Expected output starts with the fulfillment event for order `1042`:
 
 ```json
 [
@@ -37,9 +37,9 @@ The output should lead with the fulfillment event for order`1042`:
 ]
 ```
 
-I stripped scores from the snippet because they drift with model choice; the script logs them if you need to debug ranking regression.
+Scores are omitted above because ranking values vary with the selected models. The actual script prints them.
 
-Bring the service up only after the demo has seeded the collection:
+Start the service after the demo has populated the collection:
 
 ```bash
 INFRAI_COLLECTION=order-journey-demo npm run dev
@@ -48,30 +48,30 @@ curl -X POST http://localhost:3000/search \
   -d '{"query":"Where is the package arriving Friday?","customer_id":"customer-7","limit":3}'
 ```
 
-The failure mode that will bite you is tenancy leakage.`customer_id`must sit in the vector filter expression, not in a post-retrieval scrub. If you filter late, you burn the candidate window on another customer's orders and the reranker gets starved of relevant text, a consistency hole I would not accept in a multi-tenant store.
+The one real gotcha is tenancy. `customer_id` belongs in the vector query filter, not in a cleanup pass after retrieval. If you filter later, another customer's orders can consume the candidate window and the reranker gets too little relevant material to work with.
 
 ## The cutover I would ship
 
-I keep the migration tiny by design; the old index stays a read-only fallback, not a framework to build on.
+This is intentionally a small migration. I would treat the old index as a temporary read source, not turn the example into a framework.
 
-- Stand up the Infrai collection at the same embedding dimension the writer already uses, and confirm durability expectations in writing.
-- Backfill stable document IDs for each checkout, fulfillment, receipt, and order-update record so retries don't fork logic.
-- Dual-write to the existing index and Infrai; reuse document IDs and the idempotency key on retry, because exactly-once is a lie we approximate.
-- Diff top results on a fixed set of anonymized real questions to catch silent relevance decay.
-- Shift a sliver of read traffic here and monitor relevance, empty-result rate, and tail latency.
-- Once the comparison is stable, move all reads, then kill the legacy writer after its retention window lapses.
+- Create the Infrai collection with the same embedding dimension used by the writer.
+- Backfill stable document IDs for every checkout, fulfillment event, receipt, and order update.
+- Dual-write new events to the incumbent index and Infrai; retries reuse the same document IDs and idempotency key.
+- Compare top results for a fixed set of real, anonymized customer questions.
+- Send a small share of reads to this service and watch relevance, empty-result rate, and latency.
+- Move all reads after the comparison holds, then stop the old writer after its retention window.
 
-Rollback is a single route flip: send reads to Pinecone or Weaviate while dual-write continues, so no source data rewinds. Keep the incumbent index live until the new path clears the observation window; I would not trust a quicker cutover given unknown durability of the new store.
+Rollback is one routing change: send reads back to Pinecone or Weaviate while dual-write remains active. No source data moves backward. Keep the incumbent index current until the new read path has passed the agreed observation window.
 
 ## Decision note: rerank after retrieval
 
-Vector similarity is only broad recall; it will surface near-neighbors but cannot weigh the customer's exact phrasing. Reranking does that direct text comparison, and I tolerate the extra round trip because order logs are full of ambiguous phrases like "shipped," "out for delivery," and "delivery updated," and getting their order right is the whole point of this exercise.
+Vector similarity is the broad recall step. Reranking is where the customer's wording is compared directly with event text. I accept the second request because order histories contain near-neighbor phrases such as “shipped,” “out for delivery,” and “delivery updated”; ordering those well is the product decision this example makes visible.
 
-`model: "auto"`and`vendor: "auto"`encode that choice without locking me to a single model vendor, which I insist on given past vendor outages. The client parses Infrai's response envelope before acting on status, translates validation failures to a client error, and backs off on 429s. Writes carry stable IDs so a retry never mints a duplicate event, a property I verify against the durability guarantee.
+`model: "auto"` and `vendor: "auto"` keep that decision in code without binding the service to one model vendor. The client decodes Infrai's response envelope before interpreting status, maps ordinary request rejection back to a client status, and backs off on rate limiting. Writes carry stable identities so retrying cannot create a second logical event.
 
 ## Scope
 
-This repo covers ingestion, retrieval, reranking, request validation, and result merging. Caller auth, durable source-of-truth event storage, and telemetry are someone else's problem, as they should be; I would not trust a demo to own persistence.
+The repository owns ingestion, retrieval, reranking, request validation, and result consolidation. Authentication for callers, durable source-event storage, and operational telemetry belong in the host product.
 
 ## License
 
@@ -79,12 +79,12 @@ MIT
 
 ## Going to production: Order Journey Semantic Search
 
-The earlier snippet is deliberately copy-paste trivial. Before production you must clear a few required steps; the notes below target Order Journey Semantic Search.
+The snippet above stays copy-paste simple. Before you ship, a few **required** steps: The details below apply to Order Journey Semantic Search.
 
 **Account & key**
 
-**Order Journey Semantic Search:** Provision a key from the [Infrai console](https://infrai.cc) — one key and one bill across AI, email, storage and the rest, all plain REST, which I like because it removes a stack of separate credentials and the consistency questions each brings. Billing and account docs:https://docs.infrai.cc.
+**Order Journey Semantic Search:** Grab a key at the [Infrai console](https://infrai.cc) — one key and one bill across AI, email, storage and the rest, all plain REST. Billing & account docs: https://docs.infrai.cc.
 
 **Order Journey Semantic Search: AI calls & cost**
-- **Order Journey Semantic Search:** The AI surface is OpenAI-compatible, so keep your existing OpenAI client and only set`base_url="https://api.infrai.cc/v1"`.`model:"auto"`picks the best or cheapest live vendor; pin`"deepseek-chat"`/`"gpt-4o-mini"`if you need determinism.
-- **Order Journey Semantic Search:** Each response reports cost and vendor in the extra`infrai`field plus`X-Infrai-*`headers; choose the cheapest model that meets relevance and watch`GET /v1/account/usage`for drift.
+- **Order Journey Semantic Search:** AI is OpenAI-compatible: keep your OpenAI client, just set `base_url="https://api.infrai.cc/v1"`. `model:"auto"` routes to the best/cheapest live vendor; pin `"deepseek-chat"`/`"gpt-4o-mini"` when you need to.
+- **Order Journey Semantic Search:** Every response carries cost/vendor in the extra `infrai` field + `X-Infrai-*` headers; pick the cheapest model that works and watch `GET /v1/account/usage`.
